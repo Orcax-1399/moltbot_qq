@@ -7,6 +7,29 @@ interface OneBotClientOptions {
   accessToken?: string;
 }
 
+export type OneBotForwardMsg = {
+  // Some OneBot implementations return `messages`.
+  messages?: Array<{
+    sender?: {
+      user_id?: number;
+      nickname?: string;
+      card?: string;
+    };
+    time?: number;
+    content: OneBotMessage | string;
+  }>;
+
+  // Standard OneBot v11: `message` contains CQ `node` segments.
+  message?: Array<{
+    type: "node";
+    data: {
+      name?: string;
+      uin?: string;
+      content: OneBotMessage | string;
+    };
+  }>;
+};
+
 export class OneBotClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private options: OneBotClientOptions;
@@ -77,6 +100,10 @@ export class OneBotClient extends EventEmitter {
 
   async getMsg(messageId: number | string): Promise<any> {
     return this.sendWithResponse("get_msg", { message_id: messageId });
+  }
+
+  async getForwardMsg(id: string): Promise<OneBotForwardMsg> {
+    return this.sendWithResponse("get_forward_msg", { id });
   }
 
   private sendWithResponse(action: string, params: any): Promise<any> {

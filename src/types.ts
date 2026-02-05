@@ -2,7 +2,9 @@ export type OneBotMessageSegment =
   | { type: "text"; data: { text: string } }
   | { type: "image"; data: { file: string; url?: string } }
   | { type: "at"; data: { qq: string } }
-  | { type: "reply"; data: { id: string } };
+  | { type: "reply"; data: { id: string } }
+  | { type: "forward"; data: { id: string } }
+  | { type: "node"; data: { name?: string; uin?: string; content: OneBotMessage | string } };
 
 export type OneBotMessage = OneBotMessageSegment[];
 
