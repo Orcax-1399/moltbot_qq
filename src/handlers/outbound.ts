@@ -86,22 +86,54 @@ export class OutboundMessageHandler {
     const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
 
     const chunks: string[] = [];
-    const remainingLines: string[] = [];
+    const textBuf: string[] = [];
+
+    const flushText = () => {
+      const t = textBuf.join("\n").trim();
+      if (t) chunks.push(t);
+      textBuf.length = 0;
+    };
 
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
+
+      // Preserve the action+quote special case when they are on their own lines.
       if (this.isActionLine(line) && i + 1 < lines.length && this.isQuoteLine(lines[i + 1])) {
+        flushText();
         chunks.push(`${line}\n${lines[i + 1]}`);
         i += 2;
         continue;
       }
 
-      remainingLines.push(line);
+      // Also split inline actions like: "... *action here* ..." so QQ doesn't render them as one blob.
+      const parts = this.splitLineByInlineActions(line);
+      const lineTextParts: string[] = [];
+
+      for (const part of parts) {
+        if (part.kind === "action") {
+          if (lineTextParts.length > 0) {
+            textBuf.push(lineTextParts.join(" ").trim());
+            lineTextParts.length = 0;
+          }
+
+          flushText();
+          chunks.push(part.value.trim());
+          continue;
+        }
+
+        const v = part.value.trim();
+        if (v) lineTextParts.push(v);
+      }
+
+      if (lineTextParts.length > 0) {
+        textBuf.push(lineTextParts.join(" ").trim());
+      }
+
       i++;
     }
 
-    if (remainingLines.length > 0) chunks.push(remainingLines.join("\n"));
+    flushText();
 
     for (let j = 0; j < chunks.length; j++) {
       const chunk = chunks[j];
@@ -131,6 +163,56 @@ export class OutboundMessageHandler {
 
   private isQuoteLine(line: string): boolean {
     return line.trim().startsWith('"');
+  }
+
+  private splitLineByInlineActions(
+    line: string
+  ): Array<{ kind: "text" | "action"; value: string }> {
+    const parts: Array<{ kind: "text" | "action"; value: string }> = [];
+
+    const re = /\*[^*\n]{1,200}\*/g;
+    let lastIndex = 0;
+    let m: RegExpExecArray | null;
+
+    while ((m = re.exec(line)) !== null) {
+      const token = m[0];
+      const start = m.index;
+      const end = start + token.length;
+
+      if (!this.isLikelyActionToken(token)) {
+        continue;
+      }
+
+      if (start > lastIndex) {
+        parts.push({ kind: "text", value: line.slice(lastIndex, start) });
+      }
+
+      parts.push({ kind: "action", value: token });
+      lastIndex = end;
+    }
+
+    if (lastIndex === 0) {
+      return [{ kind: "text", value: line }];
+    }
+
+    if (lastIndex < line.length) {
+      parts.push({ kind: "text", value: line.slice(lastIndex) });
+    }
+
+    return parts;
+  }
+
+  private isLikelyActionToken(token: string): boolean {
+    const t = token.trim();
+    if (!(t.startsWith("*") && t.endsWith("*"))) return false;
+
+    const inner = t.slice(1, -1).trim();
+    if (!inner) return false;
+
+    // Most "action" tokens are descriptive phrases; stay conservative.
+    if (inner.includes(" ")) return true;
+
+    return /(visor|tail|horn|snout|eyes|antenna)/i.test(inner);
   }
 
   private sendToTarget(client: OneBotClient, to: string, message: OneBotMessage | string): void {

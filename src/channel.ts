@@ -110,6 +110,8 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         }
       });
 
+      const outboundHandler = new OutboundMessageHandler(getClientForAccount);
+
       client.on("message", async (event) => {
         const inbound = await inboundHandler.handle(event);
         if (!inbound) return;
@@ -117,19 +119,29 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         const { isGroup, userId, groupId, ctxPayload } = inbound;
 
         const deliver = async (payload: ReplyPayload) => {
-          const send = (msg: string) => {
-            if (isGroup) {
-              if (groupId === undefined) return;
-              client.sendGroupMsg(groupId, msg);
-            } else {
-              client.sendPrivateMsg(userId, msg);
-            }
-          };
+          if (isGroup && groupId === undefined) return;
+          const to = isGroup ? `group:${groupId}` : String(userId);
 
-          if (payload.text) send(payload.text);
+          // Important: route bot replies through the same preprocessing logic as outbound.sendText
+          // so action/quote chunking works for normal replies too.
+          if (payload.text) {
+            await outboundHandler.sendText({
+              to,
+              text: payload.text,
+              accountId: account.accountId,
+            });
+          }
+
           if (payload.files) {
             for (const file of payload.files) {
-              if (file.url) send(`[CQ:image,file=${file.url}]`);
+              if (file.url) {
+                // Keep current behavior: just send CQ image marker.
+                await outboundHandler.sendText({
+                  to,
+                  text: `[CQ:image,file=${file.url}]`,
+                  accountId: account.accountId,
+                });
+              }
             }
           }
         };
