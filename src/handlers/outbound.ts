@@ -179,7 +179,7 @@ export class OutboundMessageHandler {
       const start = m.index;
       const end = start + token.length;
 
-      if (!this.isLikelyActionToken(token)) {
+      if (!this.isLikelyActionToken(line, token, start, end)) {
         continue;
       }
 
@@ -202,17 +202,24 @@ export class OutboundMessageHandler {
     return parts;
   }
 
-  private isLikelyActionToken(token: string): boolean {
+  private isLikelyActionToken(line: string, token: string, start: number, end: number): boolean {
     const t = token.trim();
     if (!(t.startsWith("*") && t.endsWith("*"))) return false;
 
     const inner = t.slice(1, -1).trim();
     if (!inner) return false;
 
-    // Most "action" tokens are descriptive phrases; stay conservative.
-    if (inner.includes(" ")) return true;
+    // Require token boundaries so we don't split "foo*bar*baz"-style cases.
+    const before = start > 0 ? line[start - 1] : "";
+    const after = end < line.length ? line[end] : "";
+    const isBoundary = (ch: string) => !ch || /\s|[\(\)\[\]\{\}<>"'“”‘’，。！？、；：,.!?;:]/.test(ch);
+    if (!isBoundary(before) || !isBoundary(after)) return false;
 
-    return /(visor|tail|horn|snout|eyes|antenna)/i.test(inner);
+    // Avoid breaking common markdown emphasis like "I *really* like it".
+    // If it's a single short ASCII word, treat it as emphasis, not an action.
+    if (/^[A-Za-z0-9_]+$/.test(inner) && inner.length <= 20) return false;
+
+    return true;
   }
 
   private sendToTarget(client: OneBotClient, to: string, message: OneBotMessage | string): void {
