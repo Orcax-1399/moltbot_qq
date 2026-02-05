@@ -85,6 +85,42 @@ export class OutboundMessageHandler {
   ): Promise<void> {
     const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
 
+    // Build a flat stream of text/action segments (line breaks preserved via textBuf joins).
+    const segments: Array<{ kind: "text" | "action"; value: string }> = [];
+
+    for (const line of lines) {
+      // If the whole line is an action marker, keep it as a standalone action segment.
+      if (this.isActionLine(line)) {
+        segments.push({ kind: "action", value: line.trim() });
+        continue;
+      }
+
+      // Otherwise, split inline *...* action markers conservatively.
+      const parts = this.splitLineByInlineActions(line);
+      const lineTextParts: string[] = [];
+
+      for (const part of parts) {
+        if (part.kind === "action") {
+          if (lineTextParts.length > 0) {
+            segments.push({ kind: "text", value: lineTextParts.join(" ").trim() });
+            lineTextParts.length = 0;
+          }
+          segments.push({ kind: "action", value: part.value.trim() });
+          continue;
+        }
+
+        const v = part.value.trim();
+        if (v) lineTextParts.push(v);
+      }
+
+      if (lineTextParts.length > 0) {
+        segments.push({ kind: "text", value: lineTextParts.join(" ").trim() });
+      }
+    }
+
+    // Convert segments into chunks:
+    // - accumulate adjacent text
+    // - pair each action with the immediately following text (if any)
     const chunks: string[] = [];
     const textBuf: string[] = [];
 
@@ -94,43 +130,23 @@ export class OutboundMessageHandler {
       textBuf.length = 0;
     };
 
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
 
-      // Preserve the action+quote special case when they are on their own lines.
-      if (this.isActionLine(line) && i + 1 < lines.length && this.isQuoteLine(lines[i + 1])) {
-        flushText();
-        chunks.push(`${line}\n${lines[i + 1]}`);
-        i += 2;
+      if (seg.kind === "text") {
+        textBuf.push(seg.value);
         continue;
       }
 
-      // Also split inline actions like: "... *action here* ..." so QQ doesn't render them as one blob.
-      const parts = this.splitLineByInlineActions(line);
-      const lineTextParts: string[] = [];
+      flushText();
 
-      for (const part of parts) {
-        if (part.kind === "action") {
-          if (lineTextParts.length > 0) {
-            textBuf.push(lineTextParts.join(" ").trim());
-            lineTextParts.length = 0;
-          }
-
-          flushText();
-          chunks.push(part.value.trim());
-          continue;
-        }
-
-        const v = part.value.trim();
-        if (v) lineTextParts.push(v);
+      const next = segments[i + 1];
+      if (next && next.kind === "text") {
+        chunks.push(`${seg.value}\n${next.value}`);
+        i++; // consume next text
+      } else {
+        chunks.push(seg.value);
       }
-
-      if (lineTextParts.length > 0) {
-        textBuf.push(lineTextParts.join(" ").trim());
-      }
-
-      i++;
     }
 
     flushText();
