@@ -12,6 +12,7 @@ import { getQQRuntime } from "./runtime.js";
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
 import { promises as fs, existsSync } from "fs";
 import path from "path";
+import sharp from "sharp";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
   config: QQConfig;
@@ -68,7 +69,8 @@ function extractImageUrls(message: OneBotMessage | string | undefined, maxImages
   return urls;
 }
 
-const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const IMAGE_TIMEOUT_MS = 15000;
 
 function extFromContentType(contentType: string | null): string | null {
   if (!contentType) return null;
@@ -96,9 +98,106 @@ function extFromUrl(rawUrl: string): string | null {
   return null;
 }
 
+function parseContentLength(headers: Headers): number | null {
+  const v = headers.get("content-length");
+  if (!v) return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+async function readResponseBodyWithLimit(res: Response, maxBytes: number, controller?: AbortController): Promise<Buffer | null> {
+  const body = res.body;
+  if (!body) return Buffer.alloc(0);
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    received += value.byteLength;
+    if (received > maxBytes) {
+      controller?.abort();
+      return null;
+    }
+    chunks.push(value);
+  }
+
+  return Buffer.concat(chunks.map((c) => Buffer.from(c)), received);
+}
+
+async function processDownloadedImage(inPath: string, basePath: string): Promise<string | null> {
+  // Avoid breaking animated media; keep original file as-is.
+  const ext = path.extname(inPath).toLowerCase();
+  if (ext === ".gif") return inPath;
+
+  try {
+    const img = sharp(inPath).rotate();
+    const meta = await img.metadata();
+
+    if (meta.pages && meta.pages > 1) {
+      return inPath;
+    }
+
+    const hasAlpha = Boolean(meta.hasAlpha);
+    const outPath = hasAlpha ? `${basePath}.png` : `${basePath}.jpg`;
+    const tmpPath = `${outPath}.tmp`;
+
+    let pipeline = sharp(inPath).rotate().resize(2048, 2048, {
+      fit: "inside",
+      withoutEnlargement: true,
+    });
+
+    if (hasAlpha) {
+      pipeline = pipeline.png({ compressionLevel: 9, adaptiveFiltering: true });
+    } else {
+      pipeline = pipeline.jpeg({ quality: 85, progressive: true });
+    }
+
+    // Default output strips metadata unless .withMetadata() is called.
+    await pipeline.toFile(tmpPath);
+
+    await fs.rename(tmpPath, outPath);
+    if (outPath !== inPath && existsSync(inPath)) {
+      await fs.unlink(inPath).catch(() => undefined);
+    }
+
+    return outPath;
+  } catch (err) {
+    console.error("[QQ] Failed to process image:", inPath, err);
+    return inPath;
+  }
+}
+
 async function downloadUrlToTempFile(rawUrl: string, messageId: number | string, index: number): Promise<string | null> {
+  const basePath = `/tmp/qq_${messageId}_${index}`;
+
+  // HEAD: enforce size limit *before* downloading.
+  {
+    const headController = new AbortController();
+    const headTimeout = setTimeout(() => headController.abort(), IMAGE_TIMEOUT_MS);
+
+    try {
+      const headRes = await fetch(rawUrl, { method: "HEAD", signal: headController.signal });
+      if (headRes.ok) {
+        const len = parseContentLength(headRes.headers);
+        if (len !== null && len > MAX_IMAGE_BYTES) {
+          console.error(`[QQ] Image too large (${len} bytes), skipping:`, rawUrl);
+          return null;
+        }
+      }
+    } catch {
+      // Some hosts reject HEAD; fall back to limiting during GET.
+    } finally {
+      clearTimeout(headTimeout);
+    }
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort(), IMAGE_TIMEOUT_MS);
 
   try {
     const res = await fetch(rawUrl, { signal: controller.signal });
@@ -107,28 +206,71 @@ async function downloadUrlToTempFile(rawUrl: string, messageId: number | string,
       return null;
     }
 
-    const contentLength = res.headers.get("content-length");
-    if (contentLength) {
-      const len = Number(contentLength);
-      if (Number.isFinite(len) && len > MAX_MEDIA_BYTES) {
-        console.error(`[QQ] Media too large (${len} bytes), skipping:`, rawUrl);
-        return null;
-      }
+    const len = parseContentLength(res.headers);
+    if (len !== null && len > MAX_IMAGE_BYTES) {
+      console.error(`[QQ] Image too large (${len} bytes), skipping:`, rawUrl);
+      return null;
     }
 
-    const ab = await res.arrayBuffer();
-    if (ab.byteLength > MAX_MEDIA_BYTES) {
-      console.error(`[QQ] Media too large (${ab.byteLength} bytes), skipping:`, rawUrl);
+    const buffer = await readResponseBodyWithLimit(res, MAX_IMAGE_BYTES, controller);
+    if (!buffer) {
+      console.error(`[QQ] Image exceeded ${MAX_IMAGE_BYTES} bytes while downloading, skipping:`, rawUrl);
       return null;
     }
 
     const ext = extFromContentType(res.headers.get("content-type")) || extFromUrl(rawUrl) || ".jpg";
-    const outPath = `/tmp/qq_${messageId}_${index}${ext}`;
+    const downloadPath = `${basePath}${ext}`;
 
-    await fs.writeFile(outPath, Buffer.from(ab));
-    return outPath;
+    await fs.writeFile(downloadPath, buffer);
+
+    const processedPath = await processDownloadedImage(downloadPath, basePath);
+    return processedPath;
   } catch (err) {
     console.error("[QQ] Failed to download media:", rawUrl, err);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Download image from URL and convert to base64 string
+ * Returns base64 data without the data URI prefix (just the base64 content)
+ */
+async function downloadImageToBase64(rawUrl: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IMAGE_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(rawUrl, { 
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    if (!res.ok) {
+      console.error(`[QQ] Failed to download image for base64 (${res.status} ${res.statusText}):`, rawUrl);
+      return null;
+    }
+
+    const len = parseContentLength(res.headers);
+    if (len !== null && len > MAX_IMAGE_BYTES) {
+      console.error(`[QQ] Image too large for base64 (${len} bytes), skipping:`, rawUrl);
+      return null;
+    }
+
+    const buffer = await readResponseBodyWithLimit(res, MAX_IMAGE_BYTES, controller);
+    if (!buffer) {
+      console.error(`[QQ] Image exceeded ${MAX_IMAGE_BYTES} bytes while downloading for base64, skipping:`, rawUrl);
+      return null;
+    }
+
+    // Convert buffer to base64
+    const base64 = buffer.toString('base64');
+    return base64;
+  } catch (err) {
+    console.error("[QQ] Failed to download image for base64:", rawUrl, err);
     return null;
   } finally {
     clearTimeout(timeout);
@@ -697,7 +839,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 Provider: "qq",
                 Channel: "qq",
                 From: fromId,
-                To: "qq:bot", 
+                To: fromId,
                 Body: bodyWithReply,
                 RawBody: bodyText,  // 使用处理后的 bodyText 而不是原始 text
                 SenderId: String(userId),
@@ -794,8 +936,29 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
              message.push({ type: "text", data: { text } });
          }
          
+         // Process image: convert external URLs to base64 for NapCat compatibility
+         let imageFile = mediaUrl;
+         if (mediaUrl && (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://"))) {
+             // Check if it's already a QQ CDN URL
+             const isQQUrl = mediaUrl.includes("qq.com") || mediaUrl.includes("multimedia.nt.qq.com.cn");
+             if (!isQQUrl) {
+                 try {
+                     console.log(`[QQ] Converting external image to base64: ${mediaUrl.substring(0, 50)}...`);
+                     const base64Data = await downloadImageToBase64(mediaUrl);
+                     if (base64Data) {
+                         imageFile = `base64://${base64Data}`;
+                         console.log("[QQ] Successfully converted to base64");
+                     } else {
+                         console.warn("[QQ] Failed to convert image to base64, using original URL");
+                     }
+                 } catch (err) {
+                     console.error("[QQ] Error converting image to base64:", err);
+                 }
+             }
+         }
+         
          // Add image
-         message.push({ type: "image", data: { file: mediaUrl } });
+         message.push({ type: "image", data: { file: imageFile } });
 
          if (to.startsWith("group:")) {
              const groupId = parseInt(to.replace("group:", ""), 10);
