@@ -10,6 +10,8 @@ import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime } from "./runtime.js";
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
+import { promises as fs, existsSync } from "fs";
+import path from "path";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
   config: QQConfig;
@@ -66,6 +68,73 @@ function extractImageUrls(message: OneBotMessage | string | undefined, maxImages
   return urls;
 }
 
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+
+function extFromContentType(contentType: string | null): string | null {
+  if (!contentType) return null;
+  const mime = contentType.split(";")[0].trim().toLowerCase();
+  if (mime === "image/jpeg") return ".jpg";
+  if (mime === "image/png") return ".png";
+  if (mime === "image/gif") return ".gif";
+  if (mime === "image/webp") return ".webp";
+  if (mime === "image/bmp") return ".bmp";
+  if (mime === "image/tiff") return ".tiff";
+  return null;
+}
+
+function extFromUrl(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    const ext = path.extname(u.pathname).toLowerCase();
+    // Keep this conservative; we only want known image extensions.
+    if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"].includes(ext)) {
+      return ext === ".jpeg" ? ".jpg" : ext === ".tif" ? ".tiff" : ext;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+async function downloadUrlToTempFile(rawUrl: string, messageId: number | string, index: number): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const res = await fetch(rawUrl, { signal: controller.signal });
+    if (!res.ok) {
+      console.error(`[QQ] Failed to download media (${res.status} ${res.statusText}):`, rawUrl);
+      return null;
+    }
+
+    const contentLength = res.headers.get("content-length");
+    if (contentLength) {
+      const len = Number(contentLength);
+      if (Number.isFinite(len) && len > MAX_MEDIA_BYTES) {
+        console.error(`[QQ] Media too large (${len} bytes), skipping:`, rawUrl);
+        return null;
+      }
+    }
+
+    const ab = await res.arrayBuffer();
+    if (ab.byteLength > MAX_MEDIA_BYTES) {
+      console.error(`[QQ] Media too large (${ab.byteLength} bytes), skipping:`, rawUrl);
+      return null;
+    }
+
+    const ext = extFromContentType(res.headers.get("content-type")) || extFromUrl(rawUrl) || ".jpg";
+    const outPath = `/tmp/qq_${messageId}_${index}${ext}`;
+
+    await fs.writeFile(outPath, Buffer.from(ab));
+    return outPath;
+  } catch (err) {
+    console.error("[QQ] Failed to download media:", rawUrl, err);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
  * Check if message contains a reply segment
  */
@@ -78,6 +147,7 @@ function hasReplySegment(message: OneBotMessage | string | undefined): boolean {
  * Clean CQ codes from message text
  * Removes [CQ:xxx,...] format and normalizes whitespace
  * Preserves image URLs by extracting them from [CQ:image,url=...] format
+ * Also removes <file>...</file> XML tags that may contain binary content
  */
 function cleanCQCodes(text: string | undefined): string {
   if (!text) return "";
@@ -103,6 +173,10 @@ function cleanCQCodes(text: string | undefined): string {
     // Otherwise remove it
     return "";
   });
+  
+  // Remove <file>...</file> XML tags and their content (may contain binary data)
+  // Use a more robust regex that handles multiline content and various attributes
+  result = result.replace(/<file\b[^>]*>[\s\S]*?<\/file>/gi, "[文件]");
   
   result = result.replace(/\s+/g, " ").trim();
   
@@ -191,6 +265,13 @@ function flattenOneBotMessage(message: OneBotMessage | string | undefined): stri
       continue;
     }
 
+    if (seg.type === "file") {
+      // Handle file segments - show filename if available, otherwise generic placeholder
+      const fileName = seg.data?.name;
+      parts.push(fileName ? `[文件: ${fileName}]` : "[文件]");
+      continue;
+    }
+
     if (seg.type === "node") {
       parts.push(flattenOneBotMessage(seg.data?.content));
       continue;
@@ -204,6 +285,73 @@ function flattenOneBotMessage(message: OneBotMessage | string | undefined): stri
 
 function normalizeTarget(raw: string): string {
   return raw.replace(/^(qq:)/i, "");
+}
+
+// Log directory path
+const LOGS_DIR = "/root/.openclaw/extensions/qq/logs";
+
+/**
+ * Get current date string for log file naming (YYYY-MM-DD)
+ */
+function getLogDateString(): string {
+  const now = new Date();
+  return now.toISOString().split("T")[0];
+}
+
+/**
+ * Ensure logs directory exists
+ */
+async function ensureLogsDir(): Promise<void> {
+  if (!existsSync(LOGS_DIR)) {
+    try {
+      await fs.mkdir(LOGS_DIR, { recursive: true });
+    } catch (err) {
+      console.error("[QQ] Failed to create logs directory:", err);
+    }
+  }
+}
+
+/**
+ * Log message data to JSONL file
+ */
+async function logMessageToFile(logData: {
+  messageId: number;
+  userId: number;
+  groupId?: number | null;
+  rawMessage: string;
+  parsedMessage: OneBotMessage | string;
+  processedBody?: string;
+  hasFileTag?: boolean;
+  hasFileSegment?: boolean;
+}): Promise<void> {
+  try {
+    await ensureLogsDir();
+
+    const logFile = path.join(LOGS_DIR, `qq-messages-${getLogDateString()}.jsonl`);
+
+    // Truncate raw message if too long
+    let rawMessage = logData.rawMessage || "";
+    if (rawMessage.length > 10000) {
+      rawMessage = rawMessage.substring(0, 10000) + "[truncated]";
+    }
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      messageId: logData.messageId,
+      userId: logData.userId,
+      groupId: logData.groupId ?? null,
+      rawMessage: rawMessage,
+      parsedMessage: logData.parsedMessage,
+      processedBody: logData.processedBody,
+      hasFileTag: logData.hasFileTag ?? false,
+      hasFileSegment: logData.hasFileSegment ?? false,
+    };
+
+    const logLine = JSON.stringify(logEntry) + "\n";
+    await fs.appendFile(logFile, logLine, "utf-8");
+  } catch (err) {
+    console.error("[QQ] Failed to write message log:", err);
+  }
 }
 
 const clients = new Map<string, OneBotClient>();
@@ -299,6 +447,21 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             const userId = event.user_id;
             const groupId = event.group_id;
             const text = event.raw_message || "";
+
+            // Check for file segments and file tags
+            const hasFileSegment = Array.isArray(event.message) && event.message.some(seg => seg.type === "file");
+            const hasFileTag = text.includes("<file");
+
+            // Log initial message data (before processing)
+            logMessageToFile({
+              messageId: event.message_id,
+              userId: userId,
+              groupId: groupId,
+              rawMessage: text,
+              parsedMessage: event.message,
+              hasFileTag,
+              hasFileSegment,
+            });
             
             // Debug: log message structure for images
             if (Array.isArray(event.message)) {
@@ -306,6 +469,18 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 if (imageSegments.length > 0) {
                     console.log("[QQ Debug] Image segments:", JSON.stringify(imageSegments, null, 2));
                 }
+                // Debug: check for file segments
+                const fileSegments = event.message.filter(seg => seg.type === "file");
+                if (fileSegments.length > 0) {
+                    console.log("[QQ Debug] File segments:", JSON.stringify(fileSegments, null, 2));
+                }
+            }
+            // Debug: log raw_message preview to check for XML file tags
+            if (text && text.includes("<file")) {
+                console.log("[QQ Debug] raw_message contains <file> tag:");
+                console.log("[QQ Debug] raw_message preview (first 500 chars):", text.substring(0, 500));
+                console.log("[QQ Debug] typeof event.message:", typeof event.message);
+                console.log("[QQ Debug] event.message is Array:", Array.isArray(event.message));
             }
             
             // Check admin whitelist if configured
@@ -386,6 +561,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 mediaUrls = [...mediaUrls, ...repliedImages];
             }
 
+            const mediaPaths = (await Promise.all(
+                mediaUrls.map((url, i) => downloadUrlToTempFile(url, event.message_id, i))
+            )).filter((p): p is string => Boolean(p));
+
             const runtime = getQQRuntime();
 
             // Create Dispatcher
@@ -416,10 +595,16 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             let replyToBody: string | null = null;
             let replyToSender: string | null = null;
             if (replyMsgId && repliedMsg) {
-                const rawBody = typeof repliedMsg.message === 'string'
-                    ? repliedMsg.message
-                    : repliedMsg.raw_message || '';
-                replyToBody = cleanCQCodes(rawBody);
+                // Use flattenOneBotMessage for array messages to avoid XML/binary leakage from raw_message
+                if (typeof repliedMsg.message !== 'string' && Array.isArray(repliedMsg.message)) {
+                    replyToBody = flattenOneBotMessage(repliedMsg.message);
+                } else if (typeof repliedMsg.message === 'string') {
+                    replyToBody = cleanCQCodes(repliedMsg.message);
+                } else if (repliedMsg.raw_message) {
+                    replyToBody = cleanCQCodes(repliedMsg.raw_message);
+                } else {
+                    replyToBody = "[无法获取消息内容]";
+                }
                 replyToSender = repliedMsg.sender?.nickname || repliedMsg.sender?.card || String(repliedMsg.sender?.user_id || '');
                 console.log("[QQ Debug] Reply fetched:", { replyToSender, replyToBody: replyToBody.slice(0, 100) });
             }
@@ -487,7 +672,26 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 }
             }
 
-            const bodyWithReply = cleanCQCodes(text) + replySuffix + forwardBlock;
+            // 使用 flattenOneBotMessage 处理解析后的消息数组，避免二进制内容泄漏
+            let bodyText: string;
+            if (typeof event.message !== 'string' && Array.isArray(event.message)) {
+                bodyText = flattenOneBotMessage(event.message);
+            } else {
+                bodyText = cleanCQCodes(text);
+            }
+            const bodyWithReply = bodyText + replySuffix + forwardBlock;
+
+            // Log final processed message data
+            logMessageToFile({
+              messageId: event.message_id,
+              userId: userId,
+              groupId: groupId,
+              rawMessage: text,
+              parsedMessage: event.message,
+              processedBody: bodyWithReply,
+              hasFileTag,
+              hasFileSegment,
+            });
 
             const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                 Provider: "qq",
@@ -495,7 +699,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 From: fromId,
                 To: "qq:bot", 
                 Body: bodyWithReply,
-                RawBody: text,
+                RawBody: bodyText,  // 使用处理后的 bodyText 而不是原始 text
                 SenderId: String(userId),
                 MessageSid: String(event.message_id),
                 SenderName: senderName,
@@ -507,6 +711,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 OriginatingChannel: "qq",
                 OriginatingTo: fromId,
                 CommandAuthorized: true,
+                ...(mediaPaths.length > 0 && { MediaPaths: mediaPaths }),
                 ...(mediaUrls.length > 0 && { MediaUrls: mediaUrls }),
                 ...(replyMsgId && { ReplyToId: replyMsgId }),
                 ...(replyToBody && { ReplyToBody: replyToBody }),

@@ -4,7 +4,8 @@ export type OneBotMessageSegment =
   | { type: "at"; data: { qq: string } }
   | { type: "reply"; data: { id: string } }
   | { type: "forward"; data: { id: string } }
-  | { type: "node"; data: { name?: string; uin?: string; content: OneBotMessage | string } };
+  | { type: "node"; data: { name?: string; uin?: string; content: OneBotMessage | string } }
+  | { type: "file"; data: { name?: string; url?: string; file?: string; [key: string]: any } };
 
 export type OneBotMessage = OneBotMessageSegment[];
 
