@@ -73,7 +73,14 @@ export class OutboundMessageHandler {
 
     message.push({ type: "image", data: { file: imageFile } });
 
-    console.log(`[QQ] sendMedia routing: to="${opts.to}", isGroup=${opts.to.startsWith("group:")}`);
+    // Log detailed routing info for debugging
+    const isGroupTarget = opts.to.startsWith("group:");
+    console.log(`[QQ] sendMedia called: to="${opts.to}", will route to ${isGroupTarget ? "group" : "private"}`);
+    if (!isGroupTarget && /^\d+$/.test(opts.to)) {
+      console.warn(`[QQ] WARNING: Target "${opts.to}" is a raw numeric ID without 'group:' prefix. ` +
+        `If this is a group message, the caller should use 'group:${opts.to}'. ` +
+        `Currently routing as private message.`);
+    }
 
     try {
       await this.sendToTarget(client, opts.to, message);
@@ -171,7 +178,7 @@ export class OutboundMessageHandler {
         message = chunk;
       }
 
-      this.sendToTarget(client, to, message);
+      await this.sendToTarget(client, to, message);
 
       if (j < chunks.length - 1) {
         await new Promise((resolve) => setTimeout(resolve, CONSTANTS.MESSAGE_CHUNK_DELAY_MS));
@@ -245,13 +252,9 @@ export class OutboundMessageHandler {
     return true;
   }
 
-  private async sendToTarget(
-    client: OneBotClient,
-    to: string,
-    message: OneBotMessage | string
-  ): Promise<void> {
+  private sendToTarget(client: OneBotClient, to: string, message: OneBotMessage | string): void {
     const isGroup = to.startsWith("group:");
-    console.log(`[QQ] sendToTarget: to="${to}", routing to ${isGroup ? "group" : "private"}`);
+    console.log(`[QQ] sendToTarget: to="${to}", isGroup=${isGroup}, action=${isGroup ? "sendGroupMsg" : "sendPrivateMsg"}`);
 
     if (isGroup) {
       const groupId = parseInt(to.replace("group:", ""), 10);
