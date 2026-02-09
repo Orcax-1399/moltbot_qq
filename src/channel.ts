@@ -24,8 +24,25 @@ function normalizeTarget(raw: string): string {
 
 const clients = new Map<string, OneBotClient>();
 
+// Track whether a numeric ID is a group based on inbound message context
+const numericTargetIsGroup = new Map<string, boolean>();
+
 function getClientForAccount(accountId: string): OneBotClient | undefined {
   return clients.get(accountId);
+}
+
+function recordTargetContext(to: string, isGroup: boolean): void {
+  // Strip group: prefix if present to store the raw numeric ID
+  const numericId = to.replace(/^group:/, "");
+  if (/^\d+$/.test(numericId)) {
+    numericTargetIsGroup.set(numericId, isGroup);
+    // Also store with group: prefix for lookup
+    numericTargetIsGroup.set(to, isGroup);
+  }
+}
+
+function isGroupTarget(to: string): boolean | undefined {
+  return numericTargetIsGroup.get(to);
 }
 
 export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
@@ -118,6 +135,14 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
         const { isGroup, userId, groupId, ctxPayload } = inbound;
 
+        // Record target context for outbound routing
+        const targetId = isGroup ? `group:${groupId}` : String(userId);
+        recordTargetContext(targetId, isGroup);
+        if (isGroup && groupId) {
+          // Also record the group ID itself as a group target
+          recordTargetContext(String(groupId), true);
+        }
+
         const deliver = async (payload: ReplyPayload) => {
           if (isGroup && groupId === undefined) return;
           const to = isGroup ? `group:${groupId}` : String(userId);
@@ -182,11 +207,29 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
   outbound: {
     sendText: async ({ to, text, accountId, replyTo }) => {
       const handler = new OutboundMessageHandler(getClientForAccount);
-      return handler.sendText({ to, text, accountId, replyTo });
+      // Auto-fix: if to is a raw numeric ID and we know it's a group, add prefix
+      let fixedTo = to;
+      if (!to.startsWith("group:") && /^\d+$/.test(to)) {
+        const isGroup = isGroupTarget(to);
+        if (isGroup === true) {
+          fixedTo = `group:${to}`;
+          console.log(`[QQ] Auto-fixed target: "${to}" -> "${fixedTo}" (detected as group from inbound context)`);
+        }
+      }
+      return handler.sendText({ to: fixedTo, text, accountId, replyTo });
     },
     sendMedia: async ({ to, text, mediaUrl, accountId, replyTo }) => {
       const handler = new OutboundMessageHandler(getClientForAccount);
-      return handler.sendMedia({ to, text, mediaUrl, accountId, replyTo });
+      // Auto-fix: if to is a raw numeric ID and we know it's a group, add prefix
+      let fixedTo = to;
+      if (!to.startsWith("group:") && /^\d+$/.test(to)) {
+        const isGroup = isGroupTarget(to);
+        if (isGroup === true) {
+          fixedTo = `group:${to}`;
+          console.log(`[QQ] Auto-fixed target: "${to}" -> "${fixedTo}" (detected as group from inbound context)`);
+        }
+      }
+      return handler.sendMedia({ to: fixedTo, text, mediaUrl, accountId, replyTo });
     },
   },
   messaging: {
