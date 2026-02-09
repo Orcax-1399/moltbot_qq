@@ -73,8 +73,15 @@ export class OutboundMessageHandler {
 
     message.push({ type: "image", data: { file: imageFile } });
 
-    this.sendToTarget(client, opts.to, message);
-    return { channel: "qq", sent: true };
+    console.log(`[QQ] sendMedia routing: to="${opts.to}", isGroup=${opts.to.startsWith("group:")}`);
+
+    try {
+      await this.sendToTarget(client, opts.to, message);
+      return { channel: "qq", sent: true };
+    } catch (error) {
+      console.error(`[QQ] sendMedia failed:`, error);
+      return { channel: "qq", sent: false, error: String(error) };
+    }
   }
 
   private async preprocessAndSend(
@@ -238,12 +245,25 @@ export class OutboundMessageHandler {
     return true;
   }
 
-  private sendToTarget(client: OneBotClient, to: string, message: OneBotMessage | string): void {
-    if (to.startsWith("group:")) {
+  private async sendToTarget(
+    client: OneBotClient,
+    to: string,
+    message: OneBotMessage | string
+  ): Promise<void> {
+    const isGroup = to.startsWith("group:");
+    console.log(`[QQ] sendToTarget: to="${to}", routing to ${isGroup ? "group" : "private"}`);
+
+    if (isGroup) {
       const groupId = parseInt(to.replace("group:", ""), 10);
+      if (isNaN(groupId)) {
+        throw new Error(`Invalid group ID in target: ${to}`);
+      }
       client.sendGroupMsg(groupId, message);
     } else {
       const userId = parseInt(to, 10);
+      if (isNaN(userId)) {
+        throw new Error(`Invalid user ID in target: ${to}`);
+      }
       client.sendPrivateMsg(userId, message);
     }
   }
