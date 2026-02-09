@@ -207,27 +207,19 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
   outbound: {
     sendText: async ({ to, text, accountId, replyTo }) => {
       const handler = new OutboundMessageHandler(getClientForAccount);
-      // Auto-fix: if to is a raw numeric ID and we know it's a group, add prefix
-      let fixedTo = to;
-      if (!to.startsWith("group:") && /^\d+$/.test(to)) {
-        const isGroup = isGroupTarget(to);
-        if (isGroup === true) {
-          fixedTo = `group:${to}`;
-          console.log(`[QQ] Auto-fixed target: "${to}" -> "${fixedTo}" (detected as group from inbound context)`);
-        }
+      // Trim whitespace and route based on group: prefix
+      const fixedTo = to.trim();
+      if (fixedTo !== to) {
+        console.log(`[QQ] Trimmed target: "${to}" -> "${fixedTo}"`);
       }
       return handler.sendText({ to: fixedTo, text, accountId, replyTo });
     },
     sendMedia: async ({ to, text, mediaUrl, accountId, replyTo }) => {
       const handler = new OutboundMessageHandler(getClientForAccount);
-      // Auto-fix: if to is a raw numeric ID and we know it's a group, add prefix
-      let fixedTo = to;
-      if (!to.startsWith("group:") && /^\d+$/.test(to)) {
-        const isGroup = isGroupTarget(to);
-        if (isGroup === true) {
-          fixedTo = `group:${to}`;
-          console.log(`[QQ] Auto-fixed target: "${to}" -> "${fixedTo}" (detected as group from inbound context)`);
-        }
+      // Trim whitespace and route based on group: prefix
+      const fixedTo = to.trim();
+      if (fixedTo !== to) {
+        console.log(`[QQ] Trimmed target: "${to}" -> "${fixedTo}"`);
       }
       return handler.sendMedia({ to: fixedTo, text, mediaUrl, accountId, replyTo });
     },

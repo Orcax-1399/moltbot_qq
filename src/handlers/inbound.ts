@@ -171,7 +171,8 @@ export class InboundMessageHandler {
       bodyText = cleanCQCodes(rawText);
     }
 
-    const bodyWithReply = bodyText + replySuffix + forwardBlock;
+    const chatPrefix = isGroup ? `[group:${groupId ?? "unknown"}]` : "[private]";
+    const bodyWithReply = chatPrefix + bodyText + replySuffix + forwardBlock;
 
     await this.logger.logMessageToFile({
       messageId,
