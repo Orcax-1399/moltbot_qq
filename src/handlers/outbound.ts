@@ -8,9 +8,14 @@ type SendResult = { channel: string; sent: boolean; error?: string };
 
 export class OutboundMessageHandler {
   private getClientForAccount: (accountId: string) => OneBotClient | undefined;
+  private isStripMarkdownEnabled: (accountId: string) => boolean;
 
-  constructor(getClientForAccount: (accountId: string) => OneBotClient | undefined) {
+  constructor(
+    getClientForAccount: (accountId: string) => OneBotClient | undefined,
+    isStripMarkdownEnabled: (accountId: string) => boolean
+  ) {
     this.getClientForAccount = getClientForAccount;
+    this.isStripMarkdownEnabled = isStripMarkdownEnabled;
   }
 
   async sendText(opts: {
@@ -19,13 +24,14 @@ export class OutboundMessageHandler {
     accountId?: string;
     replyTo?: string;
   }): Promise<SendResult> {
-    const client = this.getClientForAccount(opts.accountId || DEFAULT_ACCOUNT_ID);
+    const accountId = opts.accountId || DEFAULT_ACCOUNT_ID;
+    const client = this.getClientForAccount(accountId);
     if (!client) {
       console.warn(`[QQ] No client for account ${opts.accountId}, cannot send text`);
       return { channel: "qq", sent: false, error: "Client not connected" };
     }
 
-    await this.preprocessAndSend(client, opts.to, opts.text, opts.replyTo);
+    await this.preprocessAndSend(client, opts.to, opts.text, accountId, opts.replyTo);
     return { channel: "qq", sent: true };
   }
 
@@ -36,7 +42,8 @@ export class OutboundMessageHandler {
     accountId?: string;
     replyTo?: string;
   }): Promise<SendResult> {
-    const client = this.getClientForAccount(opts.accountId || DEFAULT_ACCOUNT_ID);
+    const accountId = opts.accountId || DEFAULT_ACCOUNT_ID;
+    const client = this.getClientForAccount(accountId);
     if (!client) {
       console.warn(`[QQ] No client for account ${opts.accountId}, cannot send media`);
       return { channel: "qq", sent: false, error: "Client not connected" };
@@ -49,7 +56,8 @@ export class OutboundMessageHandler {
     }
 
     if (opts.text) {
-      message.push({ type: "text", data: { text: opts.text } });
+      const text = this.isStripMarkdownEnabled(accountId) ? this.stripMarkdownSyntax(opts.text) : opts.text;
+      message.push({ type: "text", data: { text } });
     }
 
     let imageFile = opts.mediaUrl;
@@ -95,9 +103,11 @@ export class OutboundMessageHandler {
     client: OneBotClient,
     to: string,
     text: string,
+    accountId: string,
     replyTo?: string
   ): Promise<void> {
-    const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+    const normalizedText = this.isStripMarkdownEnabled(accountId) ? this.stripMarkdownSyntax(text) : text;
+    const lines = normalizedText.split(/\r?\n/).filter((line) => line.trim().length > 0);
 
     // Build a flat stream of text/action segments (line breaks preserved via textBuf joins).
     const segments: Array<{ kind: "text" | "action"; value: string }> = [];
@@ -250,6 +260,33 @@ export class OutboundMessageHandler {
     if (/^[A-Za-z0-9_]+$/.test(inner) && inner.length <= 20) return false;
 
     return true;
+  }
+
+  private stripMarkdownSyntax(text: string): string {
+    const lines = text.split(/\r?\n/);
+    const result: string[] = [];
+
+    for (const rawLine of lines) {
+      let line = rawLine;
+
+      // Remove markdown headings while preserving visible content.
+      line = line.replace(/^\s{0,3}#{1,3}\s+/, "");
+
+      // Remove separator lines like "---".
+      if (/^\s*---\s*$/.test(line)) {
+        continue;
+      }
+
+      // Remove unordered list marker prefix "- ".
+      line = line.replace(/^\s*-\s+/, "");
+
+      // Remove bold markers while keeping the text.
+      line = line.replace(/\*\*([^\n]+?)\*\*/g, "$1");
+
+      result.push(line);
+    }
+
+    return result.join("\n");
   }
 
   private sendToTarget(client: OneBotClient, to: string, message: OneBotMessage | string): void {

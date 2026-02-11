@@ -5,6 +5,7 @@ export const QQConfigSchema = z.object({
   accessToken: z.string().optional().describe("The access token for the OneBot server"),
   admins: z.array(z.number()).optional().describe("List of admin QQ numbers"),
   requireMention: z.boolean().optional().default(false).describe("Require @mention or reply to bot in group chats"),
+  stripMarkdown: z.boolean().optional().default(false).describe("Strip markdown syntax before sending text to QQ"),
 });
 
 export type QQConfig = z.infer<typeof QQConfigSchema>;

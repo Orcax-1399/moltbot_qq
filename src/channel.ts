@@ -23,12 +23,17 @@ function normalizeTarget(raw: string): string {
 }
 
 const clients = new Map<string, OneBotClient>();
+const accountConfigs = new Map<string, QQConfig>();
 
 // Track whether a numeric ID is a group based on inbound message context
 const numericTargetIsGroup = new Map<string, boolean>();
 
 function getClientForAccount(accountId: string): OneBotClient | undefined {
   return clients.get(accountId);
+}
+
+function isStripMarkdownEnabled(accountId: string): boolean {
+  return accountConfigs.get(accountId)?.stripMarkdown ?? false;
 }
 
 function recordTargetContext(to: string, isGroup: boolean): void {
@@ -103,6 +108,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
       });
 
       clients.set(account.accountId, client);
+      accountConfigs.set(account.accountId, config);
 
       const runtime = getQQRuntime();
       const logger = new MessageLogger();
@@ -127,7 +133,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         }
       });
 
-      const outboundHandler = new OutboundMessageHandler(getClientForAccount);
+      const outboundHandler = new OutboundMessageHandler(getClientForAccount, isStripMarkdownEnabled);
 
       client.on("message", async (event) => {
         const inbound = await inboundHandler.handle(event);
@@ -201,12 +207,13 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
       return () => {
         client.disconnect();
         clients.delete(account.accountId);
+        accountConfigs.delete(account.accountId);
       };
     },
   },
   outbound: {
     sendText: async ({ to, text, accountId, replyTo }) => {
-      const handler = new OutboundMessageHandler(getClientForAccount);
+      const handler = new OutboundMessageHandler(getClientForAccount, isStripMarkdownEnabled);
       // Trim whitespace and route based on group: prefix
       const fixedTo = to.trim();
       if (fixedTo !== to) {
@@ -215,7 +222,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
       return handler.sendText({ to: fixedTo, text, accountId, replyTo });
     },
     sendMedia: async ({ to, text, mediaUrl, accountId, replyTo }) => {
-      const handler = new OutboundMessageHandler(getClientForAccount);
+      const handler = new OutboundMessageHandler(getClientForAccount, isStripMarkdownEnabled);
       // Trim whitespace and route based on group: prefix
       const fixedTo = to.trim();
       if (fixedTo !== to) {
